@@ -5,11 +5,16 @@
 //
 // What it does:
 // - It keeps a short tape of the recent trades on every curve it sees.
-// - It buys a coin only when the tape shows real buy pressure: enough trades in the window,
-//   several distinct buyers, most of the SOL flowing in on the buy side, and the price up a
-//   bit (but not already mooned) over the window.
-// - Every position is sold whole on a stop loss, a take profit, a trailing stop, or a time
-//   limit, whichever comes first. No position is left to ride into the ground.
+// - It buys dips, not breakouts. The first version of this bot chased coins whose price and
+//   buy flow were already rising, and on the dev tape that lost money steadily: by the time
+//   the flow looks exciting, the move is usually being sold into. So the entry now wants the
+//   opposite shape: the price is down 10-28% over the window, yet the newer half of the
+//   window shows at least 0.8 SOL of net inflow and more than the older half — sellers hit
+//   the coin, and now fresh buyers are stepping in underneath it. It also asks for at least
+//   12 window trades from at least 6 distinct buyers, with buys making up 45-68% of the
+//   traded SOL (below 45% nobody is catching the dip; above 68% the bounce already happened).
+// - Every position is sold whole on a stop loss, a take profit, a trailing stop, a flow fade
+//   (buyers vanish from the tape), or a time limit, whichever comes first.
 // - If too few coins have completed a round trip, it also opens small "probe" round trips on
 //   liquid, actively traded curves, so the run clears the guardrail of at least 20 coins with
 //   a buy of at least 0.01 SOL each.
@@ -33,31 +38,46 @@ const MIN_MAIN_LAMPORTS = (SOL * 3n) / 100n; // 0.03 SOL
 /** Slots of trade tape kept per curve (a slot is roughly 0.4 s, so this is about half a minute). */
 const TAPE_SLOTS = 90;
 /** Entry needs at least this many trades inside the tape window. */
-const MIN_WINDOW_TRADES = 8;
+const MIN_WINDOW_TRADES = 12;
 /** Entry needs at least this many distinct buying wallets inside the window. */
-const MIN_WINDOW_BUYERS = 4;
+const MIN_WINDOW_BUYERS = 6;
 /** Buys must be at least this share of the window's traded SOL (in percent). */
-const MIN_BUY_SHARE_PCT = 62;
-/** Price must be up at least this much over the window to count as momentum (percent). */
-const MIN_PRICE_UP_PCT = 2;
-/** ...but not up more than this: a coin that already ran hard in one window is skipped. */
-const MAX_PRICE_UP_PCT = 80;
+const MIN_BUY_SHARE_PCT = 45;
+/** Buys must be at most this share of the window's traded SOL (percent): a dip where buyers
+ * already dominate completely has usually already bounced. */
+const MAX_BUY_SHARE_PCT = 68;
+/** The dip band: price change over the window (percent) must sit between these two, i.e. the
+ * coin is down at least 10% (a real dip, not noise) and at most 28% (past that it is usually
+ * a coin dying, not dipping). */
+const MIN_PRICE_UP_PCT = -28;
+const MAX_PRICE_UP_PCT = -10;
+/** Net SOL inflow (buys minus sells) the newer half of the window must show, in lamports. */
+const MIN_NEWER_NET_LAMPORTS = 800_000_000n; // 0.8 SOL
 /** Real SOL reserve bounds for an entry, in SOL: too thin is untradeable, too fat is nearly done. */
-const MIN_RESERVE_SOL = 3;
+const MIN_RESERVE_SOL = 5;
 const MAX_RESERVE_SOL = 90;
 
 /** Sell everything when the position is worth this share of its cost (percent): the stop loss. */
-const STOP_LOSS_PCT = 84;
+const STOP_LOSS_PCT = 90;
 /** Sell everything when the position is worth this share of its cost (percent): the take profit. */
-const TAKE_PROFIT_PCT = 130;
+const TAKE_PROFIT_PCT = 118;
 /** Trailing stop arms at this share of cost (percent)... */
-const TRAIL_ARM_PCT = 118;
+const TRAIL_ARM_PCT = 112;
 /** ...and then sells when value falls to this share of its peak (percent). */
-const TRAIL_DROP_PCT = 88;
+const TRAIL_DROP_PCT = 90;
 /** Longest a normal position is held, in slots. */
-const MAX_HOLD_SLOTS = 900;
+const MAX_HOLD_SLOTS = 450;
 /** Longest a probe position is held, in slots. Probes are there to complete a round trip. */
-const PROBE_HOLD_SLOTS = 240;
+const PROBE_HOLD_SLOTS = 180;
+/**
+ * Flow fade exit: once a position has been held at least FADE_MIN_HOLD_SLOTS, if the tape
+ * window still has a fair number of trades but buys have dried up below this share of the
+ * traded SOL (percent), the move is over and the position is sold without waiting for the
+ * price stops. Pump.fun moves die from the flow side first.
+ */
+const FADE_MIN_HOLD_SLOTS = 30;
+const FADE_MIN_TRADES = 6;
+const FADE_BUY_SHARE_PCT = 35;
 
 /** Round trips to aim for (the guardrail asks for 20 coins; aim a little higher for slack). */
 const TARGET_ROUND_TRIPS = 24;
@@ -65,8 +85,9 @@ const TARGET_ROUND_TRIPS = 24;
 const PROBE_EVERY_SLOTS = 120;
 /** Probes only start once the run is this many slots in, so real signals get first pick. */
 const PROBE_START_SLOTS = 600;
-/** Most times one coin may be entered during the whole run. */
-const MAX_ENTRIES_PER_MINT = 2;
+/** Most times one coin may be entered during the whole run. One shot per coin: re-entering a
+ * coin that already failed (or already paid) mostly paid fees twice for the same idea. */
+const MAX_ENTRIES_PER_MINT = 1;
 /** Slots to wait after leaving a coin before it may be entered again. */
 const REENTRY_COOLDOWN_SLOTS = 300;
 
@@ -163,10 +184,9 @@ await runBot({
 
     // 2. Sync the held map with the account the harness reports: new fills become positions,
     //    positions that are gone count as completed round trips.
-    for (const [mint, pos] of state.positions) {
+    for (const mint of state.positions.keys()) {
       if (!held.has(mint)) {
         held.set(mint, { entrySlot: batch.slot, probe: buyKind.get(mint) ?? false, peakPct: 100 });
-        void pos;
       }
     }
     for (const mint of [...held.keys()]) {
@@ -195,7 +215,20 @@ await runBot({
       const takeHit = valuePct >= TAKE_PROFIT_PCT;
       const trailHit = info.peakPct >= TRAIL_ARM_PCT && valuePct <= (info.peakPct * TRAIL_DROP_PCT) / 100;
       const timeHit = heldSlots >= maxHold;
-      if (stopHit || takeHit || trailHit || timeHit) {
+      let fadeHit = false;
+      if (!info.probe && heldSlots >= FADE_MIN_HOLD_SLOTS) {
+        const tape = tapes.get(mint);
+        if (tape !== undefined && tape.trades.length >= FADE_MIN_TRADES) {
+          let fadeBuy = 0n;
+          let fadeTotal = 0n;
+          for (const t of tape.trades) {
+            fadeTotal += t.sol;
+            if (t.buy) fadeBuy += t.sol;
+          }
+          if (fadeTotal > 0n && Number((fadeBuy * 100n) / fadeTotal) < FADE_BUY_SHARE_PCT) fadeHit = true;
+        }
+      }
+      if (stopHit || takeHit || trailHit || timeHit || fadeHit) {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
         free -= txFee;
       }
@@ -219,11 +252,20 @@ await runBot({
       const sizeCap = state.maxBuyLamports(mint);
       if (sizeCap < PROBE_LAMPORTS) continue;
 
-      // Window flow: who traded, which way the SOL went, and what the price did.
+      // Window flow: who traded, which way the SOL went, and what the price did. The window
+      // is also split in half by slot: the newer half must show more net inflow than the
+      // older half, so the bot buys pressure that is building, not pressure that peaked
+      // half a minute ago and is now being sold into.
       let buySol = 0n;
       let sellSol = 0n;
+      let olderNet = 0n;
+      let newerNet = 0n;
+      const halfCut = batch.slot - TAPE_SLOTS / 2;
       const buyers = new Set<string>();
       for (const t of tape.trades) {
+        const signed = t.buy ? t.sol : -t.sol;
+        if (t.slot < halfCut) olderNet += signed;
+        else newerNet += signed;
         if (t.buy) {
           buySol += t.sol;
           buyers.add(t.user);
@@ -233,6 +275,7 @@ await runBot({
       }
       const totalSol = buySol + sellSol;
       const buySharePct = totalSol > 0n ? Number((buySol * 100n) / totalSol) : 0;
+      const accelerating = newerNet >= MIN_NEWER_NET_LAMPORTS && newerNet > olderNet;
       let priceUpPct = 0;
       if (tape.prices.length >= 2) {
         const first = tape.prices[0].price;
@@ -240,10 +283,12 @@ await runBot({
         if (first > 0) priceUpPct = ((last - first) / first) * 100;
       }
 
-      const momentum =
+      const dipEntry =
         tape.trades.length >= MIN_WINDOW_TRADES &&
         buyers.size >= MIN_WINDOW_BUYERS &&
         buySharePct >= MIN_BUY_SHARE_PCT &&
+        buySharePct <= MAX_BUY_SHARE_PCT &&
+        accelerating &&
         priceUpPct >= MIN_PRICE_UP_PCT &&
         priceUpPct <= MAX_PRICE_UP_PCT;
 
@@ -255,7 +300,7 @@ await runBot({
 
       let amount: bigint | null = null;
       let probe = false;
-      if (momentum) {
+      if (dipEntry) {
         amount = sizeCap < STAKE_LAMPORTS ? sizeCap : STAKE_LAMPORTS;
         if (amount < MIN_MAIN_LAMPORTS) amount = null;
       } else if (probesDue) {
